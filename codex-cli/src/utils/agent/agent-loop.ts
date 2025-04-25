@@ -484,13 +484,18 @@ export class AgentLoop {
         for (const item of turnInput) {
           stageItem(item as ResponseItem);
         }
-        // Send request to OpenAI with retry on timeout
-        let stream;
-
+        
         // Retry loop for transient errors. Up to MAX_RETRIES attempts.
         const MAX_RETRIES = 5;
-        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        let succeeded = false;
+        
+        // Don't clear turnInput until after we've successfully made the API call
+        // turnInput = []; // clear turn input, prepare for function call results
+        
+        for (let attempt = 1; attempt <= MAX_RETRIES && !succeeded; attempt++) {
           try {
+            // Send request to OpenAI with retry on timeout
+            let stream;
             let reasoning: Reasoning | undefined;
             if (this.model.startsWith("o")) {
               reasoning = { effort: "high" };
@@ -552,13 +557,146 @@ export class AgentLoop {
                 },
               ],
             });
-            break;
+
+            // Store the original input to preserve function calls for potential retries
+            const originalInput = [...turnInput];
+            
+            // Now that we've successfully made the API call, clear turnInput for future inputs
+            turnInput = []; // clear turn input, prepare for function call results
+            
+            // If the user requested cancellation while we were awaiting the network
+            // request, abort immediately before we start handling the stream.
+            if (this.canceled || this.hardAbort.signal.aborted) {
+              // `stream` is defined; abort to avoid wasting tokens/server work
+              try {
+                (
+                  stream as { controller?: { abort?: () => void } }
+                )?.controller?.abort?.();
+              } catch {
+                /* ignore */
+              }
+              this.onLoading(false);
+              return;
+            }
+
+            // Keep track of the active stream so it can be aborted on demand.
+            this.currentStream = stream;
+
+            // guard against an undefined stream before iterating
+            if (!stream) {
+              this.onLoading(false);
+              log("AgentLoop.run(): stream is undefined");
+              return;
+            }
+
+            // Process the stream - also inside the retry loop so we have access to 'attempt'
+            // eslint-disable-next-line no-await-in-loop
+            for await (const event of stream as AsyncIterable<ResponseEvent>) {
+              log(`AgentLoop.run(): response event ${event.type}`);
+
+              // process and surface each item (no-op until we can depend on streaming events)
+              if (event.type === "response.output_item.done") {
+                const item = event.item;
+                // 1) if it's a reasoning item, annotate it
+                type ReasoningItem = { type?: string; duration_ms?: number };
+                const maybeReasoning = item as ReasoningItem;
+                if (maybeReasoning.type === "reasoning") {
+                  maybeReasoning.duration_ms = Date.now() - thinkingStart;
+                }
+                if (item.type === "function_call") {
+                  // Track outstanding tool call so we can abort later if needed.
+                  // The item comes from the streaming response, therefore it has
+                  // either `id` (chat) or `call_id` (responses) – we normalise
+                  // by reading both.
+                  const callId =
+                    (item as { call_id?: string; id?: string }).call_id ??
+                    (item as { id?: string }).id;
+                  if (callId) {
+                    this.pendingAborts.add(callId);
+                  }
+                } else {
+                  stageItem(item as ResponseItem);
+                }
+              }
+
+              if (event.type === "response.completed") {
+                if (thisGeneration === this.generation && !this.canceled) {
+                  for (const item of event.response.output) {
+                    stageItem(item as ResponseItem);
+                  }
+                }
+                if (event.response.status === "completed") {
+                  // TODO: remove this once we can depend on streaming events
+                  const newTurnInput = await this.processEventsWithoutStreaming(
+                    event.response.output,
+                    stageItem,
+                  );
+                  turnInput = newTurnInput;
+                }
+                lastResponseId = event.response.id;
+                this.onLastResponseId(event.response.id);
+              }
+            }
+            
+            // If we made it here, the stream completed successfully
+            succeeded = true;
+            this.currentStream = null;
+            
           } catch (error) {
+            // Reset the stream for retry
+            this.currentStream = null;
+            
+            const errObj = error as Error & { 
+              code?: string; 
+              error?: { code?: string; message?: string; type?: string }; 
+              status?: number;
+              type?: string;
+              message?: string;
+              httpStatus?: number;
+              statusCode?: number;
+              param?: string;
+            };
+            
+            // Check for missing tool output errors, which happen when OpenAI expects a response to a function call
+            const isMissingToolOutput = (
+              errObj.type === "invalid_request_error" && 
+              typeof errObj.message === "string" && 
+              errObj.message.includes("No tool output found for function call")
+            );
+            
+            if (isMissingToolOutput) {
+              // Extract the function call ID from the error
+              const callIdMatch = /call_[a-zA-Z0-9]+/.exec(errObj.message);
+              const missingCallId = callIdMatch ? callIdMatch[0] : null;
+              
+              if (missingCallId) {
+                // Add a dummy response for this missing call
+                log(`Adding dummy response for missing tool call: ${missingCallId}`);
+                turnInput.push({
+                  type: "function_call_output",
+                  call_id: missingCallId,
+                  output: JSON.stringify({
+                    output: "Function call timed out or was interrupted",
+                    metadata: { exit_code: 1, duration_seconds: 0 },
+                  }),
+                } as ResponseInputItem.FunctionCallOutput);
+                
+                // Try again with the updated input
+                continue;
+              }
+            }
+            
+            // Helper function to extract status code from various error formats
+            const getStatusCode = (err: typeof errObj): number | undefined => {
+              return err?.status ?? err?.httpStatus ?? err?.statusCode;
+            };
+            
+            const status = getStatusCode(errObj);
+            
+            // Check for various error types
             const isTimeout = error instanceof APIConnectionTimeoutError;
-            // Lazily look up the APIConnectionError class at runtime to
-            // accommodate the test environment's minimal OpenAI mocks which
-            // do not define the class.  Falling back to `false` when the
-            // export is absent ensures the check never throws.
+            
+            // Lazily look up the APIConnectionError class
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const ApiConnErrCtor = (OpenAI as any).APIConnectionError as  // eslint-disable-next-line @typescript-eslint/no-explicit-any
               | (new (...args: any) => Error)
@@ -566,26 +704,80 @@ export class AgentLoop {
             const isConnectionError = ApiConnErrCtor
               ? error instanceof ApiConnErrCtor
               : false;
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const errCtx = error as any;
-            const status =
-              errCtx?.status ?? errCtx?.httpStatus ?? errCtx?.statusCode;
+              
             const isServerError = typeof status === "number" && status >= 500;
-            if (
-              (isTimeout || isServerError || isConnectionError) &&
-              attempt < MAX_RETRIES
-            ) {
-              log(
-                `OpenAI request failed (attempt ${attempt}/${MAX_RETRIES}), retrying...`,
-              );
+            
+            // Check for rate limit errors
+            const isRateLimit =
+              status === 429 ||
+              errObj.code === "rate_limit_exceeded" ||
+              errObj.type === "rate_limit_exceeded" ||
+              errObj.error?.code === "rate_limit_exceeded" ||
+              (typeof errObj.message === "string" && /rate limit/i.test(errObj.message));
+            
+            // Retry for timeouts, server errors, connection issues, or rate limits
+            if ((isTimeout || isServerError || isConnectionError || isRateLimit) && attempt < MAX_RETRIES) {
+              // Set delay based on error type
+              let delayMs = isRateLimit
+                ? RATE_LIMIT_RETRY_WAIT_MS * 2 ** (attempt - 1)
+                : 1000 * attempt; // Simple backoff for other errors
+              
+              // For rate limits, try to extract the suggested wait time
+              if (isRateLimit) {
+                // Helper to extract retry time from message
+                const extractRetryMs = (msg?: string): number | null => {
+                  if (!msg) return null;
+                  
+                  // Match both "try again in 263ms" and "try again in 1.5s" formats
+                  const match = /(?:retry|try) again in ([\d.]+)(m?s)/i.exec(msg);
+                  if (!match || !match[1]) return null;
+                  
+                  const value = parseFloat(match[1]);
+                  if (Number.isNaN(value)) return null;
+                  
+                  // Convert to milliseconds based on unit
+                  return match[2] === "ms" ? value : value * 1000;
+                };
+                
+                // Check main message and nested error message
+                const mainRetryMs = extractRetryMs(errObj.message);
+                const nestedRetryMs = extractRetryMs(errObj.error?.message);
+                
+                // Use the most specific retry time available
+                if (mainRetryMs !== null) {
+                  delayMs = mainRetryMs + 100; // Add small buffer
+                } else if (nestedRetryMs !== null) {
+                  delayMs = nestedRetryMs + 100; // Add small buffer
+                }
+                
+                // Notify the user about the rate limit
+                this.onItem({
+                  id: `rate-limit-${Date.now()}`,
+                  type: "message",
+                  role: "system",
+                  content: [
+                    {
+                      type: "input_text",
+                      text: `⏳ Rate limit reached. Retrying in ${Math.round(delayMs/1000 * 10)/10} seconds... (Attempt ${attempt}/${MAX_RETRIES})`,
+                    },
+                  ],
+                });
+              } else {
+                // Generic error retry notification
+                log(`Request failed (attempt ${attempt}/${MAX_RETRIES}), retrying in ${delayMs}ms...`);
+              }
+              
+              // Wait and continue to the next retry attempt
+              await new Promise((resolve) => setTimeout(resolve, delayMs));
               continue;
             }
-
+            
+            // Handle token limit errors
             const isTooManyTokensError =
-              (errCtx.param === "max_tokens" ||
-                (typeof errCtx.message === "string" &&
-                  /max_tokens is too large/i.test(errCtx.message))) &&
-              errCtx.type === "invalid_request_error";
+              (errObj.param === "max_tokens" ||
+                (typeof errObj.message === "string" &&
+                  /max_tokens is too large/i.test(errObj.message))) &&
+              errObj.type === "invalid_request_error";
 
             if (isTooManyTokensError) {
               this.onItem({
@@ -602,71 +794,41 @@ export class AgentLoop {
               this.onLoading(false);
               return;
             }
+            
+            // Handle exhausted rate limit retries
+            if (isRateLimit && attempt >= MAX_RETRIES) {
+              const errorDetails = [
+                `Status: ${status || "unknown"}`,
+                `Code: ${errObj.code || errObj.error?.code || "unknown"}`,
+                `Type: ${errObj.type || errObj.error?.type || "unknown"}`,
+                `Message: ${errObj.message || errObj.error?.message || "unknown"}`,
+              ].join(", ");
 
-            const isRateLimit =
-              status === 429 ||
-              errCtx.code === "rate_limit_exceeded" ||
-              errCtx.type === "rate_limit_exceeded" ||
-              /rate limit/i.test(errCtx.message ?? "");
-            if (isRateLimit) {
-              if (attempt < MAX_RETRIES) {
-                // Exponential backoff: base wait * 2^(attempt-1), or use suggested retry time
-                // if provided.
-                let delayMs = RATE_LIMIT_RETRY_WAIT_MS * 2 ** (attempt - 1);
+              this.onItem({
+                id: `error-${Date.now()}`,
+                type: "message",
+                role: "system",
+                content: [
+                  {
+                    type: "input_text",
+                    text: `⚠️  Rate limit reached. Error details: ${errorDetails}. Please try again later.`,
+                  },
+                ],
+              });
 
-                // Parse suggested retry time from error message, e.g., "Please try again in 1.3s"
-                const msg = errCtx?.message ?? "";
-                const m = /(?:retry|try) again in ([\d.]+)s/i.exec(msg);
-                if (m && m[1]) {
-                  const suggested = parseFloat(m[1]) * 1000;
-                  if (!Number.isNaN(suggested)) {
-                    delayMs = suggested;
-                  }
-                }
-                log(
-                  `OpenAI rate limit exceeded (attempt ${attempt}/${MAX_RETRIES}), retrying in ${Math.round(
-                    delayMs,
-                  )} ms...`,
-                );
-                // eslint-disable-next-line no-await-in-loop
-                await new Promise((resolve) => setTimeout(resolve, delayMs));
-                continue;
-              } else {
-                // We have exhausted all retry attempts. Surface a message so the user understands
-                // why the request failed and can decide how to proceed (e.g. wait and retry later
-                // or switch to a different model / account).
-
-                const errorDetails = [
-                  `Status: ${status || "unknown"}`,
-                  `Code: ${errCtx.code || "unknown"}`,
-                  `Type: ${errCtx.type || "unknown"}`,
-                  `Message: ${errCtx.message || "unknown"}`,
-                ].join(", ");
-
-                this.onItem({
-                  id: `error-${Date.now()}`,
-                  type: "message",
-                  role: "system",
-                  content: [
-                    {
-                      type: "input_text",
-                      text: `⚠️  Rate limit reached. Error details: ${errorDetails}. Please try again later.`,
-                    },
-                  ],
-                });
-
-                this.onLoading(false);
-                return;
-              }
+              this.onLoading(false);
+              return;
             }
-
+            
+            // Handle client errors (non-retryable)
             const isClientError =
               (typeof status === "number" &&
                 status >= 400 &&
                 status < 500 &&
                 status !== 429) ||
-              errCtx.code === "invalid_request_error" ||
-              errCtx.type === "invalid_request_error";
+              errObj.code === "invalid_request_error" ||
+              errObj.type === "invalid_request_error";
+              
             if (isClientError) {
               this.onItem({
                 id: `error-${Date.now()}`,
@@ -680,13 +842,13 @@ export class AgentLoop {
                     text: (() => {
                       const reqId =
                         (
-                          errCtx as Partial<{
+                          errObj as Partial<{
                             request_id?: string;
                             requestId?: string;
                           }>
                         )?.request_id ??
                         (
-                          errCtx as Partial<{
+                          errObj as Partial<{
                             request_id?: string;
                             requestId?: string;
                           }>
@@ -694,9 +856,9 @@ export class AgentLoop {
 
                       const errorDetails = [
                         `Status: ${status || "unknown"}`,
-                        `Code: ${errCtx.code || "unknown"}`,
-                        `Type: ${errCtx.type || "unknown"}`,
-                        `Message: ${errCtx.message || "unknown"}`,
+                        `Code: ${errObj.code || errObj.error?.code || "unknown"}`,
+                        `Type: ${errObj.type || errObj.error?.type || "unknown"}`,
+                        `Message: ${errObj.message || errObj.error?.message || "unknown"}`,
                       ].join(", ");
 
                       return `⚠️  OpenAI rejected the request${
@@ -709,140 +871,17 @@ export class AgentLoop {
               this.onLoading(false);
               return;
             }
+            
+            // If we've reached here, it's an unhandled error - rethrow
             throw error;
           }
         }
-        turnInput = []; // clear turn input, prepare for function call results
-
-        // If the user requested cancellation while we were awaiting the network
-        // request, abort immediately before we start handling the stream.
-        if (this.canceled || this.hardAbort.signal.aborted) {
-          // `stream` is defined; abort to avoid wasting tokens/server work
-          try {
-            (
-              stream as { controller?: { abort?: () => void } }
-            )?.controller?.abort?.();
-          } catch {
-            /* ignore */
-          }
+        
+        // If we complete all retries without success, stop processing
+        if (!succeeded) {
           this.onLoading(false);
           return;
         }
-
-        // Keep track of the active stream so it can be aborted on demand.
-        this.currentStream = stream;
-
-        // guard against an undefined stream before iterating
-        if (!stream) {
-          this.onLoading(false);
-          log("AgentLoop.run(): stream is undefined");
-          return;
-        }
-
-        try {
-          // eslint-disable-next-line no-await-in-loop
-          for await (const event of stream as AsyncIterable<ResponseEvent>) {
-            log(`AgentLoop.run(): response event ${event.type}`);
-
-            // process and surface each item (no-op until we can depend on streaming events)
-            if (event.type === "response.output_item.done") {
-              const item = event.item;
-              // 1) if it's a reasoning item, annotate it
-              type ReasoningItem = { type?: string; duration_ms?: number };
-              const maybeReasoning = item as ReasoningItem;
-              if (maybeReasoning.type === "reasoning") {
-                maybeReasoning.duration_ms = Date.now() - thinkingStart;
-              }
-              if (item.type === "function_call") {
-                // Track outstanding tool call so we can abort later if needed.
-                // The item comes from the streaming response, therefore it has
-                // either `id` (chat) or `call_id` (responses) – we normalise
-                // by reading both.
-                const callId =
-                  (item as { call_id?: string; id?: string }).call_id ??
-                  (item as { id?: string }).id;
-                if (callId) {
-                  this.pendingAborts.add(callId);
-                }
-              } else {
-                stageItem(item as ResponseItem);
-              }
-            }
-
-            if (event.type === "response.completed") {
-              if (thisGeneration === this.generation && !this.canceled) {
-                for (const item of event.response.output) {
-                  stageItem(item as ResponseItem);
-                }
-              }
-              if (event.response.status === "completed") {
-                // TODO: remove this once we can depend on streaming events
-                const newTurnInput = await this.processEventsWithoutStreaming(
-                  event.response.output,
-                  stageItem,
-                );
-                turnInput = newTurnInput;
-              }
-              lastResponseId = event.response.id;
-              this.onLastResponseId(event.response.id);
-            }
-          }
-        } catch (err: unknown) {
-          // Gracefully handle an abort triggered via `cancel()` so that the
-          // consumer does not see an unhandled exception.
-          if (err instanceof Error && err.name === "AbortError") {
-            if (!this.canceled) {
-              // It was aborted for some other reason; surface the error.
-              throw err;
-            }
-            this.onLoading(false);
-            return;
-          }
-          // Suppress internal stack on JSON parse failures
-          if (err instanceof SyntaxError) {
-            this.onItem({
-              id: `error-${Date.now()}`,
-              type: "message",
-              role: "system",
-              content: [
-                {
-                  type: "input_text",
-                  text: "⚠️ Failed to parse streaming response (invalid JSON). Please `/clear` to reset.",
-                },
-              ],
-            });
-            this.onLoading(false);
-            return;
-          }
-          // Handle OpenAI API quota errors
-          if (
-            err instanceof Error &&
-            (err as { code?: string }).code === "insufficient_quota"
-          ) {
-            this.onItem({
-              id: `error-${Date.now()}`,
-              type: "message",
-              role: "system",
-              content: [
-                {
-                  type: "input_text",
-                  text: "⚠️ Insufficient quota. Please check your billing details and retry.",
-                },
-              ],
-            });
-            this.onLoading(false);
-            return;
-          }
-          throw err;
-        } finally {
-          this.currentStream = null;
-        }
-
-        log(
-          `Turn inputs (${turnInput.length}) - ${turnInput
-            .map((i) => i.type)
-            .join(", ")}`,
-        );
       }
 
       // Flush staged items if the run concluded successfully (i.e. the user did
